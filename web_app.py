@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import hashlib
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -32,6 +33,22 @@ st.set_page_config(
 
 
 # =========================================================
+# USER SESSION ID
+# =========================================================
+
+# Each browser session gets a unique ID.
+# This ID is used to separate documents between users.
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = str(uuid.uuid4())
+
+USER_ID = st.session_state.user_id
+
+USER_DOCUMENTS_DIR = DOCUMENTS_DIR / USER_ID
+USER_DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
 # LOAD MODELS
 # =========================================================
 
@@ -46,15 +63,16 @@ def load_embedding_model():
 @st.cache_resource
 def load_groq():
 
-    api_key = os.getenv(
-        "GROQ_API_KEY"
-    )
+    # Streamlit Cloud Secrets
+    api_key = os.getenv("GROQ_API_KEY")
 
+    # Local .env fallback
     if not api_key:
 
         st.error(
             "GROQ_API_KEY is missing. "
-            "Please check your .env file."
+            "Please configure it in Streamlit Secrets "
+            "or your local .env file."
         )
 
         st.stop()
@@ -170,7 +188,6 @@ def extract_docx(file_path):
                 text
             )
 
-
     table_text = []
 
     # Tables
@@ -196,7 +213,6 @@ def extract_docx(file_path):
                     " | ".join(cells)
                 )
 
-
     text = ""
 
     if normal_text:
@@ -207,13 +223,11 @@ def extract_docx(file_path):
 
         text += "\n\n"
 
-
     if table_text:
 
         text += "\n".join(
             table_text
         )
-
 
     return text
 
@@ -306,13 +320,10 @@ def create_timetable_records(text):
 
     ]
 
-
     records = []
-
 
     # Find all class headings
     class_sections = []
-
 
     for i, line in enumerate(lines):
 
@@ -321,7 +332,6 @@ def create_timetable_records(text):
             class_sections.append(
                 i
             )
-
 
     for section_index, start in enumerate(
         class_sections
@@ -339,14 +349,11 @@ def create_timetable_records(text):
 
             end = len(lines)
 
-
         section = lines[
             start:end
         ]
 
-
         class_line = section[0]
-
 
         # Find lecture hall
         lecture_hall = ""
@@ -359,14 +366,12 @@ def create_timetable_records(text):
 
                 break
 
-
         # Search subject/faculty information
         for i, line in enumerate(
             section
         ):
 
             line_lower = line.lower()
-
 
             if (
                 "natural language processing"
@@ -377,7 +382,6 @@ def create_timetable_records(text):
                     max(0, i - 2):
                     min(len(section), i + 8)
                 ]
-
 
                 record = f"""
 COLLEGE TIMETABLE RECORD
@@ -392,11 +396,9 @@ Natural Language Processing:
 {chr(10).join(nearby)}
 """
 
-
                 records.append(
                     record.strip()
                 )
-
 
     return records
 
@@ -411,25 +413,30 @@ def process_document(file_path):
         file_path
     )
 
-
     if not text.strip():
 
         return 0, 0
-
 
     file_hash = get_file_hash(
         file_path
     )
 
-
-    # Delete old version
+    # Delete old version for THIS USER only
     try:
 
         old_docs = collection.get(
 
             where={
-                "source":
-                file_path.name
+                "$and": [
+                    {
+                        "source":
+                        file_path.name
+                    },
+                    {
+                        "user_id":
+                        USER_ID
+                    }
+                ]
             }
 
         )
@@ -444,9 +451,7 @@ def process_document(file_path):
 
         pass
 
-
     chunks = []
-
 
     # Timetable-specific records
     if is_timetable(text):
@@ -461,7 +466,6 @@ def process_document(file_path):
             timetable_records
         )
 
-
     # Normal chunks
     splitter = RecursiveCharacterTextSplitter(
 
@@ -471,16 +475,13 @@ def process_document(file_path):
 
     )
 
-
     normal_chunks = splitter.split_text(
         text
     )
 
-
     chunks.extend(
         normal_chunks
     )
-
 
     # Remove duplicate chunks
     unique_chunks = []
@@ -493,32 +494,26 @@ def process_document(file_path):
                 chunk
             )
 
-
     chunks = unique_chunks
-
 
     if not chunks:
 
         return 0, len(text)
-
 
     # Embeddings
     embeddings = embedding_model.encode(
         chunks
     ).tolist()
 
-
     ids = []
-
     metadatas = []
-
 
     for i, chunk in enumerate(
         chunks
     ):
 
         ids.append(
-            f"{file_hash}_{i}"
+            f"{USER_ID}_{file_hash}_{i}"
         )
 
         metadatas.append({
@@ -527,10 +522,12 @@ def process_document(file_path):
             file_path.name,
 
             "file_hash":
-            file_hash
+            file_hash,
+
+            "user_id":
+            USER_ID
 
         })
-
 
     collection.add(
 
@@ -543,7 +540,6 @@ def process_document(file_path):
         metadatas=metadatas
 
     )
-
 
     return len(chunks), len(text)
 
@@ -559,7 +555,16 @@ def delete_document(filename):
         results = collection.get(
 
             where={
-                "source": filename
+                "$and": [
+                    {
+                        "source":
+                        filename
+                    },
+                    {
+                        "user_id":
+                        USER_ID
+                    }
+                ]
             }
 
         )
@@ -576,12 +581,10 @@ def delete_document(filename):
             f"Database error: {e}"
         )
 
-
     file_path = (
-        DOCUMENTS_DIR /
+        USER_DOCUMENTS_DIR /
         filename
     )
-
 
     if file_path.exists():
 
@@ -589,42 +592,54 @@ def delete_document(filename):
 
 
 # =========================================================
-# CLEAR ALL
+# CLEAR ALL USER DOCUMENTS
 # =========================================================
 
 def clear_all_documents():
 
     try:
 
-        all_docs = collection.get()
+        user_docs = collection.get(
 
-        if all_docs["ids"]:
+            where={
+                "user_id":
+                USER_ID
+            }
+
+        )
+
+        if user_docs["ids"]:
 
             collection.delete(
-                ids=all_docs["ids"]
+                ids=user_docs["ids"]
             )
 
     except Exception:
 
         pass
 
+    if USER_DOCUMENTS_DIR.exists():
 
-    for file in DOCUMENTS_DIR.iterdir():
+        for file in USER_DOCUMENTS_DIR.iterdir():
 
-        if file.is_file():
+            if file.is_file():
 
-            file.unlink()
+                file.unlink()
 
 
 # =========================================================
-# GET DOCUMENTS
+# GET USER DOCUMENTS
 # =========================================================
 
 def get_uploaded_documents():
 
     files = []
 
-    for file in DOCUMENTS_DIR.iterdir():
+    if not USER_DOCUMENTS_DIR.exists():
+
+        return files
+
+    for file in USER_DOCUMENTS_DIR.iterdir():
 
         if file.is_file():
 
@@ -653,9 +668,8 @@ st.sidebar.title(
 
 st.sidebar.write(
     "Upload college documents to "
-    "add them to the AI knowledge base."
+    "add them to your AI knowledge base."
 )
-
 
 uploaded_files = st.sidebar.file_uploader(
 
@@ -671,7 +685,6 @@ uploaded_files = st.sidebar.file_uploader(
 
 )
 
-
 if uploaded_files:
 
     st.sidebar.write(
@@ -680,7 +693,6 @@ if uploaded_files:
         "file(s) selected."
 
     )
-
 
     for uploaded_file in uploaded_files:
 
@@ -718,18 +730,16 @@ if st.sidebar.button(
             0
         )
 
-
         for index, uploaded_file in enumerate(
             uploaded_files
         ):
 
             file_path = (
 
-                DOCUMENTS_DIR /
+                USER_DOCUMENTS_DIR /
                 uploaded_file.name
 
             )
-
 
             with open(
                 file_path,
@@ -740,13 +750,11 @@ if st.sidebar.button(
                     uploaded_file.getbuffer()
                 )
 
-
             chunks, characters = (
                 process_document(
                     file_path
                 )
             )
-
 
             if chunks == 0:
 
@@ -767,14 +775,12 @@ if st.sidebar.button(
 
                 )
 
-
             progress.progress(
 
                 (index + 1) /
                 len(uploaded_files)
 
             )
-
 
         st.sidebar.success(
 
@@ -790,12 +796,10 @@ if st.sidebar.button(
 st.sidebar.divider()
 
 st.sidebar.subheader(
-    "📂 Uploaded Documents"
+    "📂 Your Uploaded Documents"
 )
 
-
 documents = get_uploaded_documents()
-
 
 if documents:
 
@@ -807,17 +811,15 @@ if documents:
             )
         )
 
-
         col1.write(
             f"📄 {filename}"
         )
-
 
         if col2.button(
 
             "🗑️",
 
-            key=f"delete_{filename}"
+            key=f"delete_{USER_ID}_{filename}"
 
         ):
 
@@ -840,12 +842,11 @@ else:
 
 st.sidebar.divider()
 
-
 if documents:
 
     if st.sidebar.button(
 
-        "🧹 Clear All Documents",
+        "🧹 Clear My Documents",
 
         use_container_width=True
 
@@ -856,7 +857,7 @@ if documents:
         st.session_state.messages = []
 
         st.sidebar.success(
-            "All documents removed."
+            "Your documents were removed."
         )
 
         st.rerun()
@@ -903,7 +904,6 @@ question = st.chat_input(
     "Ask a question..."
 )
 
-
 if question:
 
     # =====================================================
@@ -919,7 +919,6 @@ if question:
         question
 
     })
-
 
     with st.chat_message(
         "user"
@@ -938,9 +937,7 @@ if question:
         st.session_state.messages[:-1]
     )
 
-
     conversation_text = ""
-
 
     # Keep last 6 messages
     for message in previous_messages[-6:]:
@@ -968,48 +965,18 @@ Conversation history:
 
 {conversation_text}
 
-
 Current question:
 
 {question}
 
-
 If the current question is a follow-up,
 rewrite it as a complete standalone question.
-
-Example:
-
-Previous:
-"Who teaches NLP?"
-
-Current:
-"7 semester AI&DS"
-
-Rewrite:
-"Who teaches Natural Language Processing
-for VII Semester AI&DS?"
-
-
-Another example:
-
-Previous:
-"Who teaches NLP for 7 semester AI&DS?"
-
-Current:
-"Where is the lab?"
-
-Rewrite:
-"What is the venue for Natural Language
-Processing for VII Semester AI&DS?"
-
 
 If the current question is already complete,
 return it unchanged.
 
-
 Return ONLY the rewritten question.
 """
-
 
     try:
 
@@ -1038,7 +1005,6 @@ Return ONLY the rewritten question.
             )
         )
 
-
         search_question = (
             rewrite_response
             .choices[0]
@@ -1046,7 +1012,6 @@ Return ONLY the rewritten question.
             .content
             .strip()
         )
-
 
     except Exception:
 
@@ -1063,7 +1028,6 @@ Return ONLY the rewritten question.
         ).tolist()
     )
 
-
     try:
 
         results = collection.query(
@@ -1071,7 +1035,12 @@ Return ONLY the rewritten question.
             query_embeddings=
             query_embedding,
 
-            n_results=20
+            n_results=20,
+
+            where={
+                "user_id":
+                USER_ID
+            }
 
         )
 
@@ -1085,11 +1054,9 @@ Return ONLY the rewritten question.
 
         }
 
-
     semantic_docs = results[
         "documents"
     ][0]
-
 
     semantic_metadata = results[
         "metadatas"
@@ -1129,14 +1096,11 @@ Return ONLY the rewritten question.
 
     ]
 
-
     search_lower = (
         search_question.lower()
     )
 
-
     matched_keywords = []
-
 
     for keyword in keywords:
 
@@ -1148,12 +1112,17 @@ Return ONLY the rewritten question.
 
 
     # =====================================================
-    # GET ALL DOCUMENTS
+    # GET ONLY CURRENT USER DOCUMENTS
     # =====================================================
 
     try:
 
         all_documents = collection.get(
+
+            where={
+                "user_id":
+                USER_ID
+            },
 
             include=[
                 "documents",
@@ -1162,16 +1131,13 @@ Return ONLY the rewritten question.
 
         )
 
-
         all_docs = (
             all_documents["documents"]
         )
 
-
         all_metadata = (
             all_documents["metadatas"]
         )
-
 
     except Exception:
 
@@ -1186,7 +1152,6 @@ Return ONLY the rewritten question.
 
     keyword_docs = []
 
-
     for doc, metadata in zip(
 
         all_docs,
@@ -1199,16 +1164,13 @@ Return ONLY the rewritten question.
 
         score = 0
 
-
         for keyword in matched_keywords:
 
             if keyword in doc_lower:
 
                 score += 1
 
-
         # Strong timetable bonus
-
         if (
             "college timetable record"
             in doc_lower
@@ -1216,16 +1178,13 @@ Return ONLY the rewritten question.
 
             score += 2
 
-
         # Strong NLP bonus
-
         if (
             "natural language processing"
             in doc_lower
         ):
 
             score += 3
-
 
         if score > 0:
 
@@ -1249,7 +1208,6 @@ Return ONLY the rewritten question.
 
     )
 
-
     keyword_docs = keyword_docs[:15]
 
 
@@ -1261,9 +1219,7 @@ Return ONLY the rewritten question.
 
     final_metadata = []
 
-
     # Keyword results first
-
     for score, doc, metadata in keyword_docs:
 
         if doc not in final_docs:
@@ -1276,9 +1232,7 @@ Return ONLY the rewritten question.
                 metadata
             )
 
-
     # Semantic results
-
     for doc, metadata in zip(
 
         semantic_docs,
@@ -1297,7 +1251,6 @@ Return ONLY the rewritten question.
                 metadata
             )
 
-
     final_docs = final_docs[:15]
 
     final_metadata = (
@@ -1311,7 +1264,6 @@ Return ONLY the rewritten question.
 
     context_parts = []
 
-
     for i, doc in enumerate(
         final_docs
     ):
@@ -1324,7 +1276,6 @@ Return ONLY the rewritten question.
             )
         )
 
-
         context_parts.append(
 
             f"""
@@ -1334,7 +1285,6 @@ SOURCE: {source}
 """
 
         )
-
 
     context = "\n\n".join(
         context_parts
@@ -1370,13 +1320,11 @@ documents, say:
 
 "I don't know based on the provided documents."
 
-
 ==================================================
 CONVERSATION
 ==================================================
 
 {conversation_text}
-
 
 ==================================================
 SEARCH QUESTION
@@ -1384,20 +1332,17 @@ SEARCH QUESTION
 
 {search_question}
 
-
 ==================================================
 CURRENT QUESTION
 ==================================================
 
 {question}
 
-
 ==================================================
 DOCUMENT CONTEXT
 ==================================================
 
 {context}
-
 
 ==================================================
 RULES
@@ -1432,7 +1377,6 @@ RULES
 
 """
 
-
         response = (
             groq_client
             .chat.completions.create(
@@ -1458,7 +1402,6 @@ RULES
             )
         )
 
-
         answer = (
             response
             .choices[0]
@@ -1479,7 +1422,6 @@ RULES
             answer
         )
 
-
         # =================================================
         # SOURCES
         # =================================================
@@ -1497,7 +1439,6 @@ RULES
 
                 )
 
-
                 for i, doc in enumerate(
                     final_docs
                 ):
@@ -1510,14 +1451,12 @@ RULES
                         )
                     )
 
-
                     st.markdown(
 
                         f"**Source {i + 1} — "
                         f"{source}**"
 
                     )
-
 
                     st.write(
                         doc
